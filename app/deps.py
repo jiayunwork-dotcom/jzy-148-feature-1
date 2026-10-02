@@ -9,6 +9,8 @@ import os
 import threading
 
 from .jobs.scheduler import JobScheduler
+from .monitor.audit import ScoreAudit
+from .monitor.backfill import BackfillScheduler
 from .scoring.engine import ScorecardRuntime
 from .storage.postgres import PostgresRepository
 from .storage.repository import InMemoryRepository, Repository
@@ -56,3 +58,5 @@ def build_repository() -> Repository:
 repo: Repository = build_repository()
 scheduler = JobScheduler(repo)
 runtimes = RuntimeCache(repo)
+auditor = ScoreAudit(repo, runtimes)
+backfills = BackfillScheduler(repo)

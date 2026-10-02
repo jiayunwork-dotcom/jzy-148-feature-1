@@ -22,6 +22,7 @@ class FeatureScore:
     status: str                 # ok | missing | unseen | out_of_range
     raw_value: object = None
     detail: str = ""
+    bin_index: int | None = None   # 常规箱下标（缺失=-1，未见/越界=None）
 
 
 class ScorecardRuntime:
@@ -63,6 +64,7 @@ class ScorecardRuntime:
             return FeatureScore(
                 name=name, bin_label=b["label"], woe=b["woe"],
                 score=self.missing_scores[name], status="missing", raw_value=raw,
+                bin_index=-1,
             )
 
         if ftype == "numeric":
@@ -72,6 +74,7 @@ class ScorecardRuntime:
                 return FeatureScore(
                     name=name, bin_label=b["label"], woe=b["woe"],
                     score=self.missing_scores[name], status="missing", raw_value=raw,
+                    bin_index=-1,
                 )
             bins = fblock["bins"]
             if not bins:
@@ -109,6 +112,7 @@ class ScorecardRuntime:
                 name=name, bin_label=b["label"], woe=b["woe"],
                 score=self.bin_scores[name][idx],
                 status=status, raw_value=raw, detail=detail,
+                bin_index=idx,
             )
 
         # categorical
@@ -118,7 +122,7 @@ class ScorecardRuntime:
                 return FeatureScore(
                     name=name, bin_label=b["label"], woe=b["woe"],
                     score=self.bin_scores[name][idx],
-                    status="ok", raw_value=raw,
+                    status="ok", raw_value=raw, bin_index=idx,
                 )
         return FeatureScore(
             name=name, bin_label=None, woe=0.0,

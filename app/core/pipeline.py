@@ -24,6 +24,7 @@ from .binning import FeatureBinning, bin_feature
 from .config import settings
 from .exceptions import BuildError, ValidationError
 from .metrics import ks_stat, roc_auc
+from ..monitor.baseline import build_score_baseline
 from .regression import fit_logistic, predict_proba
 from .sample import Sample
 from .scoring import build_scoring_tables
@@ -90,6 +91,24 @@ def _missing_rate(sample: Sample, name: str) -> float:
     if sample.types[name] == "numeric":
         return float(np.mean(np.isnan(v)))
     return float(np.mean([x is None for x in v]))
+
+
+def _sample_rows_as_applicants(sample: Sample) -> list[dict]:
+    """把训练样本转成在线打分入参形态（数值 NaN -> None，类别 None 保留）。
+
+    这样总分基准由**在线引擎逐行打分**得到，与投产真实调用逐位同路径；
+    建卡样本原样回放时总分 PSI 严格为 0 才有保证。
+    """
+    rows: list[dict] = [{} for _ in range(sample.n)]
+    for name in sample.feature_names:
+        col = sample.features[name]
+        if sample.types[name] == "numeric":
+            for i, v in enumerate(col):
+                rows[i][name] = None if np.isnan(v) else float(v)
+        else:
+            for i, v in enumerate(col):
+                rows[i][name] = v
+    return rows
 
 
 def run_pipeline(sample: Sample, params: BuildParams) -> dict:
@@ -228,4 +247,10 @@ def run_pipeline(sample: Sample, params: BuildParams) -> dict:
             "passed": calib_err <= 1e-6,
         },
     }
+    # 总分分布基准：训练样本经**在线引擎**逐条打分后按等频箱留存。
+    # 边际分箱计数推不出总分联合分布，故新版本建卡时必须在此一次性留好。
+    artifacts["score_baseline"] = build_score_baseline(
+        artifacts, _sample_rows_as_applicants(sample),
+        n_bins=settings.score_baseline_bins,
+    )
     return artifacts

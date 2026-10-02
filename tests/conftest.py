@@ -28,8 +28,12 @@ def client():
     repo._cards.clear()
     repo._versions.clear()
     repo._jobs.clear()
+    repo._score_records.clear()
+    repo._score_index.clear()
+    repo._backfill_jobs.clear()
     with repo._lock:
         repo._job_seq = 0
+        repo._backfill_seq = 0
     runtimes._cache.clear()
     yield TestClient(app)
 

@@ -14,7 +14,8 @@ from fastapi.responses import JSONResponse
 from .core.exceptions import ValidationError
 from .core.pipeline import BuildParams
 from .core.sample import parse_csv
-from .deps import repo, runtimes, scheduler
+from .deps import auditor, backfills, repo, runtimes, scheduler
+from .api.monitor import router as monitor_router
 from .api.schemas import (
     BatchScoreRequest,
     BatchScoreResponse,
@@ -23,6 +24,7 @@ from .api.schemas import (
     JobOut,
     ScoreResponse,
 )
+from .monitor.audit import InvalidRequestId, RequestIdConflict
 
 
 @contextlib.asynccontextmanager
@@ -30,6 +32,7 @@ async def lifespan(app: FastAPI):
     repo.init_schema()
     yield
     scheduler._pool.shutdown(wait=True)
+    backfills.shutdown()
 
 
 app = FastAPI(title="内部评分卡服务", version="1.0.0", lifespan=lifespan)
@@ -155,58 +158,37 @@ def list_jobs(card_name: str | None = None):
 
 # ---------------------------------------------------------------- 打分
 
-def _load_runtime(card_name: str, version: int | None):
-    try:
-        return runtimes.get(card_name, version)
-    except KeyError as exc:
-        raise HTTPException(404, str(exc))
-
 
 @app.post("/cards/{card_name}/score", response_model=ScoreResponse)
 def score_applicant(card_name: str, body: dict):
-    version = body.get("version")
-    features = body.get("features")
-    if not isinstance(features, dict):
+    if not isinstance(body.get("features"), dict):
         raise HTTPException(400, "features 必须是对象：{特征名: 原始值}")
-    ver, rt = _load_runtime(card_name, version)
     try:
-        result = rt.score(features)
+        outcome = auditor.score_single(card_name, body)
+    except InvalidRequestId as exc:
+        raise HTTPException(400, str(exc))
+    except RequestIdConflict as exc:
+        # 同标识不同内容：明确拒绝（409），绝不覆盖原留痕
+        raise HTTPException(409, str(exc))
+    except KeyError as exc:
+        raise HTTPException(404, str(exc))
     except ValueError as exc:
         raise HTTPException(400, f"该申请人打分失败：{exc}")
-    return {"card_name": card_name, "version": ver, **result}
+    # 响应字段与数值保持原样（request_id 为入参，不回显新字段）
+    return {"card_name": card_name, "version": outcome.version,
+            **outcome.result}
 
 
 @app.post("/cards/{card_name}/score/batch", response_model=BatchScoreResponse)
 def score_batch(card_name: str, req: BatchScoreRequest):
-    ver, rt = _load_runtime(card_name, req.version)
-    results = []
-    ok_cnt = fail_cnt = 0
-    for item in req.applicants:
-        try:
-            r = rt.score(item.features)
-            results.append({
-                "applicant_id": item.applicant_id,
-                "ok": True,
-                "total_score": r["total_score"],
-                "pd": r["pd"],
-                "features": r["features"],
-                "has_unseen": r["has_unseen"],
-                "has_missing": r["has_missing"],
-                "error": None,
-            })
-            ok_cnt += 1
-        except Exception as exc:  # 单条出错只影响那一条
-            results.append({
-                "applicant_id": item.applicant_id,
-                "ok": False,
-                "total_score": None,
-                "pd": None,
-                "features": None,
-                "has_unseen": False,
-                "has_missing": False,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
-            fail_cnt += 1
+    try:
+        ver, _rt = runtimes.get(card_name, req.version)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc))
+    # 逐项留痕；单条出错（含幂等冲突）只影响那一条，原批量隔离语义不变
+    results = auditor.score_batch(card_name, req.version, req.applicants)
+    ok_cnt = sum(1 for r in results if r["ok"])
+    fail_cnt = len(results) - ok_cnt
     return BatchScoreResponse(
         card_name=card_name, version=ver, results=results,
         succeeded=ok_cnt, failed=fail_cnt,
@@ -216,3 +198,7 @@ def score_batch(card_name: str, req: BatchScoreRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# 监控路由在所有 @app 装饰器路由定义之后挂载（集中管理）
+app.include_router(monitor_router)

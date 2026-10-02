@@ -50,12 +50,21 @@ class ScoreResponse(BaseModel):
 class BatchItem(BaseModel):
     applicant_id: str = Field(..., description="调用方自定义的申请人标识")
     features: dict[str, Any]
+    request_id: str | None = Field(
+        None, description="调用方请求标识：同标识同内容重放幂等、不同内容拒绝")
 
 
 class BatchScoreRequest(BaseModel):
     card_name: str | None = None   # 卡名以路径参数为准，这里可选仅为兼容
     version: int | None = None
     applicants: list[BatchItem]
+
+
+class ScoreRequest(BaseModel):
+    version: int | None = None
+    features: dict[str, Any]
+    request_id: str | None = Field(
+        None, description="调用方请求标识：同标识同内容重放幂等、不同内容拒绝")
 
 
 class BatchResult(BaseModel):
@@ -75,3 +84,20 @@ class BatchScoreResponse(BaseModel):
     results: list[BatchResult]
     succeeded: int
     failed: int
+
+
+# ------------------------------------------------------------ 表现回填
+class BackfillItem(BaseModel):
+    request_id: str
+    label: Any = Field(..., description="实际是否违约，必须为 0/1")
+
+
+class BackfillRequest(BaseModel):
+    items: list[BackfillItem] = Field(..., min_length=1)
+
+
+class BackfillAccepted(BaseModel):
+    job_id: int
+    card_name: str
+    total: int
+    status: str = "pending"

@@ -20,6 +20,13 @@ class Settings:
     newton_max_iter: int = 100
     newton_tol: float = 1e-10
     batch_size_limit: int = 10_000
+    # ---- 投产后监控：PSI 三档阈值（评分卡行业惯例 0.1 / 0.25）----
+    psi_warning: float = 0.10
+    psi_significant: float = 0.25
+    # 总分基准默认分箱数（按训练总分等频切，打结不拆开）
+    score_baseline_bins: int = 10
+    backfill_workers: int = 2
+    backfill_progress_every: int = 200
 
 
 settings = Settings()

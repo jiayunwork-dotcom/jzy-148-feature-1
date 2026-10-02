@@ -7,18 +7,28 @@ jobs(id BIGSERIAL PK, card_name, status, request JSONB, error,
      newton_history JSONB, version, 时间戳)
 versions(card_name, version, job_id, status, summary JSONB, artifacts JSONB,
          PK(card_name, version))
+score_records(id BIGSERIAL PK, card_name, version, request_id, request_hash,
+              features JSONB 原始入参, result JSONB 完整打分结果, total_score,
+              pd, label SMALLINT NULL 表现回填, scored_at TIMESTAMPTZ)
+  - 幂等：(card_name, request_id) 上的**部分**唯一索引（request_id IS NOT NULL），
+    不带标识的重放不去重；插入冲突后比对 request_hash 决定幂等返回或拒绝。
+backfill_jobs(回填后台作业：进度计数 + rejected JSONB 拒收清单)
 
 同名卡并发建卡：save_version 在事务内先对 cards 行 FOR UPDATE 取锁再分配
 max(version)+1，因此并发作业串行分配、绝不重号。
+
+平滑升级：所有对象 CREATE TABLE/INDEX IF NOT EXISTS，只新增不改动既有表，
+在已有数据的老库上直接 init_schema 即可，无需清库。
 """
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import psycopg
 from psycopg.types.json import Jsonb
 
-from .repository import Repository
+from .repository import IdempotencyConflict, Repository
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cards (
@@ -47,6 +57,40 @@ CREATE TABLE IF NOT EXISTS versions (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (card_name, version)
 );
+CREATE TABLE IF NOT EXISTS score_records (
+    id            BIGSERIAL PRIMARY KEY,
+    card_name     TEXT NOT NULL REFERENCES cards(name),
+    version       INTEGER NOT NULL,
+    request_id    TEXT,
+    request_hash  TEXT NOT NULL,
+    features      JSONB NOT NULL,
+    result        JSONB NOT NULL,
+    total_score   DOUBLE PRECISION NOT NULL,
+    pd            DOUBLE PRECISION NOT NULL,
+    label         SMALLINT,
+    scored_at     TIMESTAMPTZ NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS score_records_idem_idx
+    ON score_records(card_name, request_id) WHERE request_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS score_records_query_idx
+    ON score_records(card_name, version, scored_at);
+CREATE INDEX IF NOT EXISTS score_records_lookup_idx
+    ON score_records(card_name, request_id);
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+    id          BIGSERIAL PRIMARY KEY,
+    card_name   TEXT NOT NULL REFERENCES cards(name),
+    status      TEXT NOT NULL,
+    total       INTEGER NOT NULL DEFAULT 0,
+    processed   INTEGER NOT NULL DEFAULT 0,
+    applied     INTEGER NOT NULL DEFAULT 0,
+    duplicates  INTEGER NOT NULL DEFAULT 0,
+    rejected    JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS backfill_jobs_card_idx
+    ON backfill_jobs(card_name, id);
 """
 
 
@@ -260,3 +304,282 @@ class PostgresRepository(Repository):
             "created_at": r[7].isoformat() if r[7] else None,
             "updated_at": r[8].isoformat() if r[8] else None,
         } for r in rows]
+
+    # ------------------------------------------------------------ 打分留痕
+    def find_score_record(self, card_name: str,
+                          request_id: str) -> dict | None:
+        with self._p().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, card_name, version, request_id, request_hash,
+                           features, result, total_score, pd, label, scored_at
+                    FROM score_records
+                    WHERE card_name=%s AND request_id=%s
+                """, (card_name, request_id))
+                row = cur.fetchone()
+        return self._record_from_row(row) if row else None
+
+    @staticmethod
+    def _record_from_row(row) -> dict:
+        result = row[6]
+        return {
+            "id": row[0], "card_name": row[1], "version": row[2],
+            "request_id": row[3], "request_hash": row[4],
+            "features": row[5], "result": result,
+            "total_score": row[7], "pd": row[8],
+            "features_detail": result["features"],
+            "label": row[9],
+            "scored_at": row[10],
+        }
+
+    @staticmethod
+    def _record_view(row: dict) -> dict:
+        return {
+            "id": row["id"], "card_name": row["card_name"],
+            "version": row["version"], "request_id": row["request_id"],
+            "total_score": row["total_score"], "pd": row["pd"],
+            "features": row["features_detail"], "label": row["label"],
+            "scored_at": row["scored_at"],
+        }
+
+    def insert_score_record(
+        self, card_name: str, version: int, request_id: str | None,
+        request_hash: str, features: dict, result: dict,
+        scored_at: datetime,
+    ) -> tuple[str, dict]:
+        if scored_at.tzinfo is None:
+            scored_at = scored_at.replace(tzinfo=timezone.utc)
+        with self._p().connection() as conn:
+            try:
+                with conn.cursor() as cur:
+                    if request_id is None:
+                        cur.execute("""
+                            INSERT INTO score_records
+                                (card_name, version, request_id, request_hash,
+                                 features, result, total_score, pd, scored_at)
+                            VALUES (%s, %s, NULL, %s, %s, %s, %s, %s, %s)
+                            RETURNING id
+                        """, (card_name, version, request_hash,
+                              Jsonb(features), Jsonb(result),
+                              result["total_score"], result["pd"], scored_at))
+                        rec_id = cur.fetchone()[0]
+                        status = "inserted"
+                    else:
+                        cur.execute("""
+                            INSERT INTO score_records
+                                (card_name, version, request_id, request_hash,
+                                 features, result, total_score, pd, scored_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (card_name, request_id)
+                            WHERE request_id IS NOT NULL
+                            DO NOTHING
+                            RETURNING id
+                        """, (card_name, version, request_id, request_hash,
+                              Jsonb(features), Jsonb(result),
+                              result["total_score"], result["pd"], scored_at))
+                        row = cur.fetchone()
+                        status = "inserted" if row else "duplicate"
+                        rec_id = row[0] if row else None
+                    if status == "duplicate":
+                        cur.execute("""
+                            SELECT id, card_name, version, request_id,
+                                   request_hash, features, result, total_score,
+                                   pd, label, scored_at
+                            FROM score_records
+                            WHERE card_name=%s AND request_id=%s
+                        """, (card_name, request_id))
+                        existing_row = cur.fetchone()
+                    conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        if status == "inserted":
+            return "inserted", {
+                "id": rec_id, "card_name": card_name, "version": version,
+                "request_id": request_id, "request_hash": request_hash,
+                "features": features, "result": result,
+                "total_score": result["total_score"], "pd": result["pd"],
+                "features_detail": result["features"], "label": None,
+                "scored_at": scored_at,
+            }
+        existing = self._record_from_row(existing_row)
+        if existing["request_hash"] != request_hash:
+            raise IdempotencyConflict(
+                f"请求标识 {request_id!r} 已存在但内容不同，拒绝覆盖")
+        return "duplicate", existing
+
+    def list_score_records(
+        self, card_name: str, version: int,
+        start: datetime | None = None, end: datetime | None = None,
+        labeled: bool | None = None,
+    ) -> list[dict]:
+        sql = [
+            "SELECT id, card_name, version, request_id, request_hash,",
+            "       features, result, total_score, pd, label, scored_at",
+            "FROM score_records WHERE card_name=%s AND version=%s",
+        ]
+        args: list = [card_name, version]
+        if start is not None:
+            sql.append("AND scored_at >= %s")
+            args.append(start)
+        if end is not None:
+            sql.append("AND scored_at < %s")
+            args.append(end)
+        if labeled is True:
+            sql.append("AND label IS NOT NULL")
+        elif labeled is False:
+            sql.append("AND label IS NULL")
+        sql.append("ORDER BY id")
+        with self._p().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(" ".join(sql), args)
+                rows = cur.fetchall()
+        return [self._record_view(self._record_from_row(r)) for r in rows]
+
+    def count_score_records(
+        self, card_name: str, version: int | None = None,
+        start: datetime | None = None, end: datetime | None = None,
+    ) -> int:
+        sql = ["SELECT COUNT(*) FROM score_records WHERE card_name=%s"]
+        args: list = [card_name]
+        if version is not None:
+            sql.append("AND version=%s")
+            args.append(version)
+        if start is not None:
+            sql.append("AND scored_at >= %s")
+            args.append(start)
+        if end is not None:
+            sql.append("AND scored_at < %s")
+            args.append(end)
+        with self._p().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(" ".join(sql), args)
+                return int(cur.fetchone()[0])
+
+    # ------------------------------------------------------------ 表现回填
+    def apply_label(self, card_name: str, request_id: str,
+                    label: int) -> str:
+        with self._p().connection() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE score_records SET label=%s
+                        WHERE card_name=%s AND request_id=%s
+                          AND label IS NULL
+                    """, (int(label), card_name, request_id))
+                    if cur.rowcount == 1:
+                        outcome = "applied"
+                    else:
+                        cur.execute("""
+                            SELECT label FROM score_records
+                            WHERE card_name=%s AND request_id=%s
+                        """, (card_name, request_id))
+                        row = cur.fetchone()
+                        if row is None:
+                            outcome = "missing"
+                        elif int(row[0]) == int(label):
+                            outcome = "duplicate"
+                        else:
+                            outcome = "conflict"
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return outcome
+
+    def create_backfill_job(self, card_name: str,
+                            items: list[dict]) -> int:
+        with self._p().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO backfill_jobs(card_name, status, total)
+                    VALUES (%s, 'pending', %s) RETURNING id
+                """, (card_name, len(items)))
+                job_id = cur.fetchone()[0]
+            conn.commit()
+        return job_id
+
+    def update_backfill_job(self, job_id: int, status: str, **fields) -> None:
+        allowed = {"total", "processed", "applied", "duplicates", "rejected"}
+        sets = ["status=%s", "updated_at=now()"]
+        args: list = [status]
+        for k, v in fields.items():
+            if k in allowed:
+                if k == "rejected":
+                    sets.append(f"{k}=%s")
+                    args.append(Jsonb(v))
+                else:
+                    sets.append(f"{k}=%s")
+                    args.append(v)
+        args.append(job_id)
+        with self._p().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE backfill_jobs SET {', '.join(sets)} WHERE id=%s",
+                    args)
+            conn.commit()
+
+    def _backfill_from_row(self, r) -> dict:
+        return {
+            "id": r[0], "card_name": r[1], "status": r[2], "total": r[3],
+            "processed": r[4], "applied": r[5], "duplicates": r[6],
+            "rejected": r[7] or [],
+            "created_at": r[8].isoformat() if r[8] else None,
+            "updated_at": r[9].isoformat() if r[9] else None,
+        }
+
+    _BACKFILL_COLS = (
+        "id, card_name, status, total, processed, applied, duplicates, "
+        "rejected, created_at, updated_at"
+    )
+
+    def get_backfill_job(self, job_id: int) -> dict | None:
+        with self._p().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {self._BACKFILL_COLS} FROM backfill_jobs "
+                    "WHERE id=%s",
+                    (job_id,))
+                row = cur.fetchone()
+        return self._backfill_from_row(row) if row else None
+
+    def list_backfill_jobs(self, card_name: str | None = None) -> list[dict]:
+        with self._p().connection() as conn:
+            with conn.cursor() as cur:
+                if card_name:
+                    cur.execute(
+                        f"SELECT {self._BACKFILL_COLS} FROM backfill_jobs "
+                        "WHERE card_name=%s ORDER BY id",
+                        (card_name,))
+                else:
+                    cur.execute(
+                        f"SELECT {self._BACKFILL_COLS} FROM backfill_jobs "
+                        "ORDER BY id")
+                rows = cur.fetchall()
+        return [self._backfill_from_row(r) for r in rows]
+
+    # ------------------------------------------------------------ 总分基准
+    def set_score_baseline(self, card_name: str, version: int,
+                           baseline: dict) -> None:
+        with self._p().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE versions
+                    SET artifacts = jsonb_set(artifacts, '{score_baseline}', %s),
+                        summary = jsonb_set(summary, '{score_baseline}', 'true')
+                    WHERE card_name=%s AND version=%s
+                """, (Jsonb(baseline), card_name, version))
+                if cur.rowcount == 0:
+                    raise KeyError(f"卡 {card_name!r} 版本 {version} 不存在")
+            conn.commit()
+
+    def clear_score_baseline(self, card_name: str, version: int) -> None:
+        with self._p().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE versions
+                    SET artifacts = jsonb_set(artifacts, '{score_baseline}', 'null'),
+                        summary = jsonb_set(summary, '{score_baseline}', 'false')
+                    WHERE card_name=%s AND version=%s
+                """, (card_name, version))
+            conn.commit()
