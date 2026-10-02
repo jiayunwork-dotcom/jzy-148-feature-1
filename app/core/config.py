@@ -20,6 +20,11 @@ class Settings:
     newton_max_iter: int = 100
     newton_tol: float = 1e-10
     batch_size_limit: int = 10_000
+    # 投产后监控：PSI 三档阈值（含端点的归属见 app/monitoring/psi.py）
+    psi_stable_max: float = 0.10          # PSI < 0.10 稳定
+    psi_warning_max: float = 0.25         # 0.10 <= PSI < 0.25 需关注；>= 显著漂移
+    score_baseline_bins: int = 10         # 建卡样本总分基准的等频分箱数
+    monitor_query_limit: int = 1_000_000  # 单次稳定性/表现查询最多扫描的记录数
 
 
 settings = Settings()

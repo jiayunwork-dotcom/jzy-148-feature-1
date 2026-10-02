@@ -50,6 +50,9 @@ class ScoreResponse(BaseModel):
 class BatchItem(BaseModel):
     applicant_id: str = Field(..., description="调用方自定义的申请人标识")
     features: dict[str, Any]
+    request_id: str | None = Field(
+        None, description="幂等请求标识；同标识同内容重放只算一次打分，"
+                          "同标识不同内容拒绝")
 
 
 class BatchScoreRequest(BaseModel):
@@ -67,6 +70,8 @@ class BatchResult(BaseModel):
     has_unseen: bool = False
     has_missing: bool = False
     error: str | None = None
+    replayed: bool = False
+    conflict: bool = False
 
 
 class BatchScoreResponse(BaseModel):
@@ -74,4 +79,26 @@ class BatchScoreResponse(BaseModel):
     version: int
     results: list[BatchResult]
     succeeded: int
-    failed: int
+    failed: int = 0
+    replayed: int = 0
+    conflicts: int = 0
+
+
+# ------------------------------------------------------------ 投产后监控
+
+class BackfillItem(BaseModel):
+    request_id: str
+    label: Any = Field(..., description="实际是否违约，只接受 0/1（true/false 等拒收）")
+
+
+class BackfillRequest(BaseModel):
+    items: list[BackfillItem]
+
+
+class BackfillEnqueueResponse(BaseModel):
+    job_id: int
+    card_name: str
+    total: int
+    invalid_rejected: int
+    invalid_rejected_items: list[dict[str, Any]] = []
+    status: str = "pending"

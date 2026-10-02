@@ -25,5 +25,24 @@ services:
     ports:
       - "8000:8000"
 
+  # 真实 PostgreSQL 16 上的监控集成测试：
+  #   docker compose run --build tests
+  # （镜像只 COPY 了 app，测试与数据通过卷挂进去）
+  tests:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://scorecard:scorecard@db:5432/scorecard
+      RUN_PG_TESTS: "1"
+    working_dir: /work
+    volumes:
+      - ./:/work
+    command: >
+      sh -c "pip install --no-cache-dir pytest httpx &&
+             python -m pytest tests/test_postgres_integration.py -q"
+    profiles: ["test"]
+
 volumes:
   pgdata:

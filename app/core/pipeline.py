@@ -228,4 +228,9 @@ def run_pipeline(sample: Sample, params: BuildParams) -> dict:
             "passed": calib_err <= 1e-6,
         },
     }
+    # 投产后监控基准（新版本特有）：建卡样本逐条打分的总分等频分布。
+    # 纯增量字段；升级前的老版本产物无此块，总分稳定性按 unavailable 呈现，
+    # 特征层稳定性不受影响（基准直接取上面各特征的逐箱好坏计数）。
+    from ..monitoring.baseline import build_monitoring_baseline
+    artifacts["monitoring"] = build_monitoring_baseline(sample, params, artifacts)
     return artifacts

@@ -8,7 +8,11 @@ from __future__ import annotations
 import os
 import threading
 
+from .audit.service import AuditService
 from .jobs.scheduler import JobScheduler
+from .monitoring.service import MonitoringService
+from .performance.scheduler import BackfillScheduler
+from .performance.service import PerformanceService
 from .scoring.engine import ScorecardRuntime
 from .storage.postgres import PostgresRepository
 from .storage.repository import InMemoryRepository, Repository
@@ -56,3 +60,8 @@ def build_repository() -> Repository:
 repo: Repository = build_repository()
 scheduler = JobScheduler(repo)
 runtimes = RuntimeCache(repo)
+# 投产后监控三件套
+audit = AuditService(repo)
+monitoring = MonitoringService(repo)
+performance = PerformanceService(repo)
+backfills = BackfillScheduler(repo)
